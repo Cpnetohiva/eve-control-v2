@@ -95,13 +95,19 @@ function procesarFilaDestaraje(fila) {
   }
 }
 
+function normalizarTicketComparacion(valor) {
+  const digitos = String(valor ?? '').replace(/\D/g, '');
+  return digitos.replace(/^0+(?=\d)/, '');
+}
+
 function procesarFilaPagos(fila) {
   const fechaTexto = normalizarFecha(fila.Fecha);
   if (!validarFormatoFecha(fechaTexto)) {
     return { valido: false, motivo: 'Fecha debe tener el formato DD-MM-AAAA', registro: null, original: fila };
   }
   const ticket = String(fila.Ticket ?? '').trim();
-  const cxp = (window.EVE.cuentasPorPagar || []).find((c) => String(c.ticket) === ticket);
+  const ticketNormalizado = normalizarTicketComparacion(ticket);
+  const cxp = (window.EVE.cuentasPorPagar || []).find((c) => normalizarTicketComparacion(c.ticket) === ticketNormalizado);
   const original = cxp
     ? {
         ...fila,
@@ -427,7 +433,8 @@ Object.assign(window.EVE_ADMIN_IMPORTAR, {
   procesarFilaPagos,
   procesarFilaSaldoInicial,
   procesarFilaInventarioInicial,
-  procesarHojaControlProduccion
+  procesarHojaControlProduccion,
+  normalizarTicketComparacion
 });
 
 function procesarHoja(filasCrudas, procesador) {
@@ -726,6 +733,150 @@ async function sincronizarPagosConCxP(filasProcesadas) {
   }
 }
 
+async function resincronizarPagosHuerfanos() {
+  const [pagosFrescos, cuentasFrescas] = await Promise.all([
+    window.cargarDatos('pagos'),
+    window.cargarDatos('cuentas_por_pagar')
+  ]);
+  window.EVE.cuentasPorPagar = cuentasFrescas;
+
+  const huerfanos = pagosFrescos.filter((p) => !p.grupoPagoId && !p.revertido);
+  const abonosYaAsignados = new Set();
+  const vinculados = [];
+  const ambiguos = [];
+  const sinMatch = [];
+
+  for (const pago of huerfanos) {
+    const ticketNormalizado = normalizarTicketComparacion(pago.ticket);
+    const cxp = cuentasFrescas.find((c) => normalizarTicketComparacion(c.ticket) === ticketNormalizado);
+    if (!cxp) {
+      sinMatch.push({ ticket: pago.ticket, proveedor: pago.proveedor, monto: pago.pagado, detalle: 'Sin CxP con ese ticket' });
+      continue;
+    }
+    try {
+      // sincronizarPagosConCxP (importación original) nunca marcó grupoPagoId, así que un abono
+      // ya existente sin grupoPagoId y con mismo monto/fecha es el que este pago generó en su momento;
+      // solo hay que etiquetarlo, no crear uno nuevo (evita duplicar el abono). Si hay más de un
+      // candidato no se puede saber con certeza cuál corresponde a este pago — se marca como ambiguo
+      // en vez de asignar el primero disponible, para no arriesgar una trazabilidad incorrecta.
+      const candidatos = (cxp.abonos || []).filter((a) =>
+        !a.grupoPagoId && !abonosYaAsignados.has(a) && Number(a.monto) === Number(pago.pagado) && a.fecha === pago.fecha
+      );
+      if (candidatos.length > 1) {
+        ambiguos.push({ ticket: pago.ticket, proveedor: pago.proveedor, monto: pago.pagado, fecha: pago.fecha, candidatos: candidatos.length });
+        continue;
+      }
+      const grupoPagoId = window.EVE_CXP.generarGrupoPagoId();
+      if (candidatos.length === 1) {
+        const abonoExistente = candidatos[0];
+        abonosYaAsignados.add(abonoExistente);
+        const abonos = cxp.abonos.map((a) => (a === abonoExistente ? { ...a, grupoPagoId } : a));
+        await window.actualizarDato('cuentas_por_pagar', cxp.id, { abonos });
+        Object.assign(cxp, { abonos });
+      } else {
+        await window.EVE_CXP.actualizarAbonoCxP(cxp.id, {
+          monto: pago.pagado,
+          fecha: pago.fecha,
+          referencia: 'Resincronizado (pago huérfano post-importación)',
+          registradoPor: usuarioActual(),
+          fechaRegistro: new Date().toISOString(),
+          grupoPagoId
+        });
+      }
+      await window.actualizarDato('pagos', pago.id, { grupoPagoId });
+      pago.grupoPagoId = grupoPagoId;
+      vinculados.push({ ticket: pago.ticket, proveedor: pago.proveedor, monto: pago.pagado });
+    } catch (error) {
+      sinMatch.push({ ticket: pago.ticket, proveedor: pago.proveedor, monto: pago.pagado, detalle: error.message });
+    }
+  }
+
+  window.EVE.registrosPagos = pagosFrescos;
+
+  return { totalHuerfanos: huerfanos.length, vinculados, ambiguos, sinMatch };
+}
+
+function construirTablaResincronizacion(columnas, filas, obtenerValores) {
+  const tabla = document.createElement('table');
+  tabla.className = 'tabla-destaraje';
+  const filaEncabezado = document.createElement('tr');
+  columnas.forEach((nombreColumna) => {
+    const celda = document.createElement('th');
+    celda.textContent = nombreColumna;
+    filaEncabezado.appendChild(celda);
+  });
+  const cabecera = document.createElement('thead');
+  cabecera.appendChild(filaEncabezado);
+  tabla.appendChild(cabecera);
+
+  const tbody = document.createElement('tbody');
+  filas.forEach((item) => {
+    const fila = document.createElement('tr');
+    obtenerValores(item).forEach((valor) => {
+      const celda = document.createElement('td');
+      celda.textContent = valor;
+      fila.appendChild(celda);
+    });
+    tbody.appendChild(fila);
+  });
+  tabla.appendChild(tbody);
+
+  const envoltura = document.createElement('div');
+  envoltura.className = 'destaraje-tabla-wrapper';
+  envoltura.appendChild(tabla);
+  return envoltura;
+}
+
+function renderizarResumenResincronizacion(resultado) {
+  const contenedor = document.getElementById('ai-resync-resultado');
+  if (!contenedor) return;
+  contenedor.innerHTML = '';
+  const resumen = document.createElement('p');
+  resumen.innerHTML = `<strong>${resultado.totalHuerfanos}</strong> pagos huérfanos encontrados — <strong>${resultado.vinculados.length}</strong> vinculados automáticamente, <strong>${resultado.ambiguos.length}</strong> ambiguos (requieren revisión manual), <strong>${resultado.sinMatch.length}</strong> sin match (huérfanos reales).`;
+  contenedor.appendChild(resumen);
+
+  if (resultado.ambiguos.length > 0) {
+    const tituloAmbiguos = document.createElement('p');
+    tituloAmbiguos.innerHTML = '<strong>⚠️ Ambiguos — no se asignaron automáticamente:</strong> más de un abono candidato con el mismo monto y fecha en la misma CxP, no se puede saber con certeza cuál corresponde a este pago. Revisa manualmente cuál abono corresponde a cada pago.';
+    contenedor.appendChild(tituloAmbiguos);
+    contenedor.appendChild(construirTablaResincronizacion(
+      ['Ticket', 'Proveedor', 'Monto', 'Fecha', 'Abonos candidatos'],
+      resultado.ambiguos,
+      (item) => [item.ticket, item.proveedor, window.formatearMoneda(item.monto), item.fecha, item.candidatos]
+    ));
+  }
+
+  if (resultado.sinMatch.length > 0) {
+    const nota = document.createElement('p');
+    nota.style.fontSize = '0.85em';
+    nota.style.color = '#666';
+    nota.textContent = 'Sin match: se esperan tickets de años previos a 2026 sin Destaraje cargado. Si aparece un ticket de 2026, hay un mismatch real de datos que requiere revisión caso por caso.';
+    contenedor.appendChild(nota);
+    contenedor.appendChild(construirTablaResincronizacion(
+      ['Ticket', 'Proveedor', 'Monto', 'Detalle'],
+      resultado.sinMatch,
+      (item) => [item.ticket, item.proveedor, window.formatearMoneda(item.monto), item.detalle]
+    ));
+  }
+}
+
+async function manejarResincronizarPagosHuerfanos() {
+  const boton = document.getElementById('ai-resincronizar');
+  const contenedor = document.getElementById('ai-resync-resultado');
+  boton.disabled = true;
+  if (contenedor) contenedor.innerHTML = '<p>Resincronizando…</p>';
+  try {
+    const resultado = await resincronizarPagosHuerfanos();
+    renderizarResumenResincronizacion(resultado);
+    window.showSuccess(`Resincronización completada: ${resultado.vinculados.length} vinculados, ${resultado.ambiguos.length} ambiguos, ${resultado.sinMatch.length} sin match`);
+  } catch (error) {
+    if (contenedor) contenedor.innerHTML = '';
+    window.showError(error.message);
+  } finally {
+    boton.disabled = false;
+  }
+}
+
 async function manejarConfirmarImportacion() {
   document.getElementById('ai-confirmar-importacion').disabled = true;
   try {
@@ -768,6 +919,7 @@ function crearVistaImportar() {
       <h3>Importar Datos</h3>
       <button type="button" id="ai-descargar-plantilla" class="btn-secondary">Descargar plantilla</button>
     </div>
+    <p style="background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;padding:0.5rem 0.75rem;font-size:0.85em;">⚠️ Orden de carga: Precios → Destaraje → <strong>Generar corte</strong> (en CxP) → Pagos. Verifica que ya diste clic en "Generar corte" en CxP para este periodo antes de importar Pagos — si no, los pagos no encontrarán su CxP y quedarán como "Sin CxP vinculada".</p>
     <input type="file" id="ai-archivo" accept=".xlsx">
     <div class="admin-importar-modo">
       <label><input type="radio" name="ai-modo" value="agregar" id="ai-modo-agregar" checked> Agregar</label>
@@ -777,6 +929,13 @@ function crearVistaImportar() {
     <input type="text" id="ai-confirmar-texto" placeholder="Escribe CONFIRMAR" style="display:none">
     <div id="ai-vista-previa"></div>
     <button type="button" id="ai-confirmar-importacion" class="btn-primary" disabled>Confirmar importación</button>
+    <hr>
+    <div class="admin-importar-header">
+      <h3>Resincronizar pagos huérfanos</h3>
+      <button type="button" id="ai-resincronizar" class="btn-secondary">Resincronizar pagos huérfanos</button>
+    </div>
+    <p style="font-size:0.85em;color:#666;">Busca pagos ya guardados en Firestore que no quedaron vinculados a su Cuenta por Pagar (por ejemplo, porque el corte de CxP se generó después de importar los Pagos) e intenta vincularlos ahora, leyendo datos frescos de Firestore.</p>
+    <div id="ai-resync-resultado"></div>
   `;
   tarjeta.querySelector('#ai-descargar-plantilla').addEventListener('click', manejarDescargarPlantilla);
   tarjeta.querySelector('#ai-archivo').addEventListener('change', manejarSeleccionArchivo);
@@ -784,6 +943,7 @@ function crearVistaImportar() {
   tarjeta.querySelector('#ai-modo-reemplazar').addEventListener('change', () => manejarCambioModo('reemplazar'));
   tarjeta.querySelector('#ai-confirmar-texto').addEventListener('input', actualizarBotonConfirmar);
   tarjeta.querySelector('#ai-confirmar-importacion').addEventListener('click', manejarConfirmarImportacion);
+  tarjeta.querySelector('#ai-resincronizar').addEventListener('click', manejarResincronizarPagosHuerfanos);
   return tarjeta;
 }
 
